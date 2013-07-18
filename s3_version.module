@@ -1,0 +1,272 @@
+<?php
+
+/**
+ * @file
+ * AWS s3 version viewer.
+ */
+
+/**
+ * Custom function that returns AWS client object.
+ * @return Returns client object.
+ */
+function s3_version_aws_client() {
+  $client = Aws\S3\S3Client::factory(array(
+    'key' => variable_get('aws_key'),
+    'secret' => variable_get('aws_secret'),
+  ));
+  
+  return $client;
+}
+
+/**
+ * Implements hook_init().
+ */
+function s3_version_init() {
+  libraries_load('awssdk');
+}
+
+/**
+ * Implements hook_menu().
+ */
+function s3_version_menu() {
+  $items['admin/config/media/s3_viewer/admin'] = array(
+    'title' => 'AWS S3 version admin',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('s3_version_admin_settings'),
+    'file' => 's3_version_admin.inc',
+    'access arguments' => array('administer s3 version viewer'),
+  );
+  
+  $items['admin/config/media/s3_viewer'] = array(
+    'title' => 'AWS S3 versioned files',
+    'page callback' => 's3_version_viewer_page',
+    'access arguments' => array('view s3 version viewer page'),
+  );
+  
+  $items['admin/config/media/s3_viewer/%/view'] = array(
+    'title' => 'File versions',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('s3_version_viewer_form', 4),
+    'access arguments' => array('view s3 version viewer page'),
+    'type' => MENU_CALLBACK,
+  );
+  
+  $items['admin/config/media/s3_viewer/admin/%/version_enable'] = array(
+    'title' => 'Enable versioning',
+    'page callback' => 's3_version_viewer_version_enable',
+    'page arguments' => array(5),
+    'access arguments' => array('administer s3 version viewer'),
+    'type' => MENU_CALLBACK,
+  );
+  
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function s3_version_permission() {
+  return array(
+    'administer s3 version viewer' => array(
+      'title' => t('Administer s3 version viewer'),
+      'description' => t('Access administration settings for s3 version viewer.'),
+    ),
+    'view s3 version viewer page' => array(
+      'title' => t('Administer s3 version viewer'),
+      'description' => t('Access s3 version viewer page.'),
+    ),
+  );
+}
+
+/**
+ * Custom page for viewing s3 bucket versioned files.
+ */
+function s3_version_viewer_page() {
+  
+  $list = array();
+  $bucket = variable_get('s3_version_bucket', '');
+  
+  if ($bucket) {
+    
+    // Store client object.
+    $client = s3_version_aws_client();
+    
+    // Grab all objects in bucket (up to 1000).
+    $objects = $client->listObjects(array(
+      'Bucket' => $bucket,
+    ));
+    
+    // Build header for table.
+    $header = array(
+      'key' => t('Name'),
+      'date' => t('Last modified'),
+      'size' => t('Size'),
+    );
+    
+    foreach ($objects['Contents'] as $object_key => $object_value) {
+      // This hides "directories".
+      if ($object_value['Size'] > 0) {        
+        $options[$object_key] = array(
+          'key' => l($object_value['Key'], 'admin/config/media/s3_viewer/' . urlencode($object_value['Key']) . '/view'),
+          'date' => $object_value['LastModified'],
+          'size' => $object_value['Size'],
+        );
+      }
+    }
+    
+    $output = array(
+      '#theme' => 'table',
+      '#header' => $header,
+      '#rows' => $options,
+      '#empty' => t('Bucket contains no files.'),
+    );
+    
+  }
+  else {
+    drupal_set_message(l('Please provide a bucket in the s3 version viewer admin page.', 'admin/config/media/s3_viewer/admin'));
+  }
+  
+  return $output;
+}
+
+/**
+ * Custom form for restoring obect versions.
+ */
+function s3_version_viewer_form($form, &$form_state, $key) {
+    
+  // Grab key from URL.
+  $key = urldecode($key);
+  
+  // Get client object.
+  $client = s3_version_aws_client();
+
+  // Grabs all objects versions in $bucket.
+  $versions = $client->listObjectVersions(array(
+    'Bucket' => variable_get('s3_version_bucket'),
+    'Prefix' => $key,
+  ));
+  
+  // Build table header.
+  $header = array(
+    'key' => t('Name'),
+    'vid' => t('Version ID'),
+    'date' => t('Last Modified'),
+    'size' => t('Size'),
+  );
+  
+  // Loop through each file version to build table rows.
+  $options = array();
+  
+  foreach ($versions['Versions'] as $version_key => $version_value) {
+    $options[$version_key] = array(
+      'key' => $version_value['Key'],
+      'vid' => $version_value['VersionId'],
+      'date' => $version_value['LastModified'],
+      'size' => $version_value['Size'],
+    );
+  }
+  
+  $form['s3_version_viewer_table'] = array(
+    '#type' => 'tableselect',
+    '#header' => $header,
+    '#options' => $options,
+    '#empty' => t('No versions available.'),
+    '#multiple' => FALSE,
+  );
+  
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+  );
+  
+  $form['back'] = array(
+    '#type' => 'submit',
+    '#value' => t('Back'),
+    '#submit' => array('s3_version_viewer_form_back'),
+  );
+  
+  return ($form);
+}
+
+/**
+ * Custom submit function for s3_version_viewer_form.
+ */
+function s3_version_viewer_form_submit($form, &$form_state) {
+  
+  // Get client object.
+  $client = s3_version_aws_client();
+  
+  // Create bucket variable.
+  $bucket = variable_get('s3_version_bucket');
+  
+  // Store table selection.
+  $selection = $form_state['values']['s3_version_viewer_table'];
+  $selection_data = $form['s3_version_viewer_table']['#options'][$selection];
+  
+  // Create key and vid variables.
+  $key = $selection_data['key'];
+  $vid = $selection_data['vid'];
+  
+  // Copy object back into bucket, making it the newest version.
+  $replace = $client->copyObject(array(
+    'Bucket' => $bucket,
+    'CopySource' => $bucket . '/' . $key . '?versionId=' . $vid,
+    'Key' => $key,
+  ));
+  
+  if (isset($replace)) {
+    drupal_set_message('File has been restored.');
+  }
+  else {
+    drupal_set_message('Something has gone terribly wrong.');
+  }
+  
+}
+
+/**
+ * Custom back function for s3_version_viewer_form.
+ */
+function s3_version_viewer_form_back() {
+  drupal_goto('admin/config/media/s3_viewer');
+}
+
+/**
+ * Menu callback; get confirm form for enabling versioning.
+ */
+function s3_version_viewer_version_enable($bucket) {
+  return drupal_get_form('s3_version_viewer_version_enable_confirm', $bucket);
+}
+
+/**
+ * Build confirm form for enabling versioning on bucket.
+ */
+function s3_version_viewer_version_enable_confirm($form, &$form_state, $bucket) {
+  
+  $form['bucket'] = array(
+    '#type' => 'value',
+    '#value' => $bucket,
+  );
+  
+  $caption = '<p>' . t('This action cannot be undone.') . '</p>';
+  $heading = t('Are you sure you want to enable versioning on the ' . $bucket . ' bucket?');
+  $cancel_path = 'admin/config/media/s3_viewer/admin';
+  $yes = t('Enable versioning');
+  $no = t('Cancel');
+  return confirm_form($form, $heading, $cancel_path, $caption, $yes, $no);
+}
+
+/**
+ * Submit function for enabling versioning confirm form.
+ */
+function s3_version_viewer_version_enable_confirm_submit($form, &$form_state) {
+  
+  $client = s3_version_aws_client();
+  
+  $enable_version = $client->putBucketVersioning(array(
+    'Bucket' => $form_state['values']['bucket'],
+    'Status' => 'Enabled',
+  ));
+  
+  drupal_set_message('Versioning has been enabled.');
+  drupal_goto('admin/config/media/s3_viewer/admin');
+}
